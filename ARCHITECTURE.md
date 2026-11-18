@@ -84,6 +84,301 @@ MRedisCache/
 
 两套目标框架下使用的 SqlSugar 公共 API（`Queryable / Insertable / Updateable / Deleteable / SugarColumn`）完全一致，业务代码无感知。
 
+### 1.3 类关系图
+
+三张类图的成员与关系均与实际代码一一对应（泛型写作 `CacheManager~T~` / `CacheMap~V~`）；图例统一如下：
+
+| 记号 | 含义 | 典型示例 |
+|---|---|---|
+| `A *-- B` | 组合：B 的生命周期归 A | Client → 两个后台服务（Dispose 反向关闭） |
+| `A o-- B` | 聚合：A 持有 B 的引用，不掌管生命周期 | TableStore → Manager 装配绑定 |
+| `A --> B` | 关联：字段引用 | CacheManager._client → MRedisCacheClient |
+| `A ..> B` | 依赖：方法调用 | Manager → RedisSyncService.EnqueueUpsert |
+| `A --|> B` | 继承 | CacheRedisDatabaseObject → CacheObject |
+| `A ..|> B` | 实现接口 | CacheManager&lt;T&gt; → ICacheManager |
+
+`JsonUtil / UniqueIdGenerator（含 UnixTime） / Log` 为全局静态工具门面，被全部核心类调用，图中省略以保持可读。
+
+**图 A：实例装配关系（谁创建谁、谁持有谁，与 Create / Dispose 装配顺序一致）：**
+
+```mermaid
+classDiagram
+    direction TB
+
+    class MRedisCacheOptions {
+        +string CacheName
+        +bool EnableDatabase
+        +DbType DbType
+        +string ConnectionString
+        +List~string~ RedisEndpoints
+        +int RedisBatchSize
+        +int FlushIntervalMs
+        +int FlushBatchSize
+        +int ReconcileIntervalSeconds
+        +int EvictBatchLimit
+    }
+
+    class MRedisCacheClient {
+        +string CacheName
+        +long InstanceUid
+        +bool InitialLoadCompleted
+        +Create(options)$
+        +GetManager() CacheManager~T~
+        +GetMap(name) CacheMap~V~
+        +CompleteInitialLoad()
+        +Dispose()
+    }
+
+    class CacheStore {
+        +string CacheName
+        +Tables IEnumerable
+        +GetTable(tableName) TableStore
+        +FindManager(tableName) ICacheManager
+        +ResolveManager() CacheManager
+        +RegisterManager(entityType, manager)
+        +NotifyFieldChanged(obj, fieldName, oldValue)
+    }
+
+    class TableStore {
+        +string TableName
+        +Data ConcurrentDictionary
+        +Manager ICacheManager
+        +bool EvictExpired
+        +int ExpiredSeconds
+        +BindManager() bool
+        +MarkDirty(uid)
+        +TakeDirty(max) List
+    }
+
+    class CacheMapRegistry {
+        +Find(redisKey) CacheMapInfo
+        +Register(redisKey, info)
+        +All() IEnumerable
+    }
+
+    MRedisCacheClient ..> MRedisCacheOptions : Create 校验并读取
+    MRedisCacheClient *-- "1" CacheStore : Store 内部仓库
+    MRedisCacheClient *-- "0..1" RedisSyncService : Redis（未配置时为 null）
+    MRedisCacheClient *-- "0..1" PersistenceService : Persistence（未启用时为 null）
+    MRedisCacheClient *-- "1" CacheMapRegistry : Maps 远端 Map 路由表
+    MRedisCacheClient *-- "*" CacheMap~V~ : _mapCache 名称→实例（类型擦除为 object）
+    CacheStore *-- "*" TableStore : _tables 表名→存储单元
+    CacheStore o-- "*" ICacheManager : _managers 类型注册表
+    TableStore o-- "0..1" ICacheManager : Manager 装配绑定（BindManager 原子守卫）
+    TableStore *-- "*" CacheObject : Data UID→对象（含去重脏队列）
+    CacheStore ..> ICacheManager : NotifyFieldChanged 按表名转发
+```
+
+要点：
+
+- 两个后台服务的创建时机在 `MRedisCacheClient.Create`（PersistenceService 先于 RedisSyncService 装配，Dispose 反向先停前者）；
+- `CacheMap<V>` 在 Client 中以 `object` 类型擦除缓存（`_mapCache`），远端变更路由靠 `CacheMapRegistry`（完整 Redis Key → 委托）；
+- `TableStore.Manager`（BindManager 原子守卫）与 `CacheStore._managers`（类型注册表）指向同一批 Manager 实例——前者管"这张表归谁"，后者管"这个类型归谁"。
+
+**图 B：业务交互面（实体层级 · Manager · Map · 元数据——业务代码只接触这张图里的公开类）：**
+
+```mermaid
+classDiagram
+    direction TB
+
+    class CacheLevel {
+        <<enum>>
+        Local
+        Redis
+        RedisDatabase
+    }
+
+    class CacheObject {
+        <<abstract>>
+        +long CacheObjectUID
+        +long CacheCreateTime
+        +long CacheUpdateTime
+        +CacheLevel Level
+        +bool IsInCache
+        +bool IsNew
+        +bool IsDirty
+        +bool IsDeleted
+        +TableName() string
+        #SetProperty(field, value) bool
+    }
+
+    class ICacheManager {
+        <<interface>>
+        +string TableName
+        +OnLocalFieldChanged(obj, fieldName, oldValue)
+        +OnRemoteUpsert(uid, json)
+        +OnRemoteDelete(uid)
+        +LoadFromRedis()
+        +LoadFromDatabase()
+        +FlushDirty()
+        +ProcessExpired(budget) int
+    }
+
+    class CacheManager~T~ {
+        +string TableName
+        +string RedisKey
+        +Get(uid) T
+        +GetByPrimaryKey(key) T
+        +Get(probe) T
+        +Add(value) bool
+        +Remove(uid) bool
+        +Values IEnumerable~T~
+        +Count int
+        #AddCustomIndex(value)
+        #RemoveCustomIndex(value)
+        #UpdateCustomIndex(value, fieldName, oldValue)
+    }
+
+    class CacheMap~V~ {
+        +string Name
+        +string RedisKey
+        +Get(key) V
+        +Add(key, value)
+        +AddIfNotExist(key, value)
+        +Remove(key) bool
+        +Clear()
+        +Count int
+    }
+
+    class CacheMapInfo {
+        +Upsert Action
+        +Delete Action
+        +Reload Action
+    }
+
+    class EntityMeta {
+        <<static>>
+        +GetPrimaryKeys(type)$ List
+        +GetBehavior(type)$ CacheBehaviorAttribute
+        +GetPrimaryKeyValue(obj)$ string
+    }
+
+    class CacheBehaviorAttribute {
+        +bool LoadOnStartup
+        +bool SyncDeleteToDatabase
+        +bool EvictExpired
+        +int ExpiredSeconds
+    }
+
+    CacheObject --> CacheLevel : Level 层级
+    CacheLocalObject --|> CacheObject : Local 仅内存
+    CacheRedisObject --|> CacheObject : Redis 内存+Redis
+    CacheRedisDatabaseObject --|> CacheObject : RedisDatabase 三级
+    FAB_STATION --|> CacheRedisDatabaseObject : 业务实体示例
+    CacheObject --> CacheStore : Owner 变更路由入口
+    CacheManager~T~ ..|> ICacheManager : 类型擦除路由视图
+    FabStationMgr --|> CacheManager~T~ : 自定义索引子类示例
+    CacheManager~T~ --> MRedisCacheClient : _client
+    CacheManager~T~ --> TableStore : _table
+    CacheManager~T~ ..> RedisSyncService : EnqueueUpsert / EnqueueDelete
+    CacheManager~T~ ..> PersistenceService : QueryAll / QueryByPrimaryKeys / Execute
+    CacheManager~T~ ..> EntityMeta : 主键与行为元数据
+    EntityMeta ..> CacheBehaviorAttribute : GetBehavior
+    EntityMeta ..> CachePrimaryKeyAttribute : 主键识别（优先级 2）
+    EntityMeta ..> SugarColumn : 主键识别（优先级 1，推荐）
+    CacheMap~V~ --> MRedisCacheClient : _client
+    CacheMap~V~ ..> RedisSyncService : EnqueueMapUpsert / EnqueueMapDelete
+    CacheMapInfo ..> CacheMap~V~ : Upsert / Delete / Reload 委托绑定
+    CacheMapRegistry o-- "*" CacheMapInfo : _maps 完整 Key→路由信息
+```
+
+要点：
+
+- 业务代码可见的类只有：`MRedisCacheClient`、`CacheManager<T>`（或其子类）、`CacheMap<V>`、三个实体基类与两个特性；其余全部 internal；
+- 实体属性 setter 经 `SetProperty → Owner（CacheStore）` 按表名路由回所属 Manager，图中 `CacheObject --> CacheStore` 即这条回路的入口（本地写路径 3.3 的第 1 步）；
+- `EntityMeta` 为静态缓存：反射只在类型首次使用时做一次，主键取值编译为委托（见 2.对照表 #17）。
+
+**图 C：后台服务内部结构（通道 · 线程 · 载荷 · 外部连接）：**
+
+```mermaid
+classDiagram
+    direction LR
+
+    class RedisSyncService {
+        <<internal>>
+        +VersionField$
+        +UpsertScript$
+        +DeleteScript$
+        +EnqueueUpsert(obj)
+        +EnqueueDelete(obj)
+        +EnqueueMapUpsert(redisKey, field, json)
+        +EnqueueMapDelete(redisKey, field)
+        +HashGet(key, field) string
+        +HashGetAll(key) Dictionary
+        +DrainPendingDuringLoad() int
+    }
+
+    class RedisWrite {
+        <<struct>>
+        +RedisOp Op
+        +string Key
+        +string Field
+        +string Json
+    }
+
+    class RedisOp {
+        <<enum>>
+        Upsert
+        Delete
+    }
+
+    class RemoteMessage {
+        <<private nested>>
+        +long Sender
+        +string Option
+        +string Key
+        +string Field
+    }
+
+    class PersistenceService {
+        <<internal>>
+        +CreateClient() SqlSugarClient
+        +QueryAll() List
+        +QueryByPrimaryKeys(probe, primaryKeys) T
+        +Execute(inserts, updates, deletes)
+    }
+
+    RedisWrite --> RedisOp : Op
+    RedisSyncService *-- "*" RedisWrite : _writes 写通道载荷
+    RedisSyncService *-- "*" RemoteMessage : _applies 应用通道 / _pendingDuringLoad 加载期缓冲
+    RedisSyncService --> ConnectionMultiplexer : _mux（StackExchange.Redis，自动重连）
+    RedisSyncService --> IDatabase : _db
+    RedisSyncService --> ChannelMessageQueue : _subscription 订阅泵
+    RedisSyncService ..> CacheStore : FindManager 按表名路由
+    RedisSyncService ..> ICacheManager : OnRemoteUpsert / OnRemoteDelete
+    RedisSyncService ..> CacheMapRegistry : Find 按完整 Key 路由
+    PersistenceService ..> CacheStore : Tables 遍历全部表
+    PersistenceService ..> ICacheManager : FlushDirty / ProcessExpired
+    PersistenceService ..> SqlSugarClient : CreateClient 每批独立实例
+```
+
+要点：
+
+- `RedisWrite` 是业务线程 → 写线程的传递单元（序列化在入队时完成，捕获变更时刻快照）；`RemoteMessage` 是订阅频道上的定位符（~100B，不带数据本体，防回声靠 Sender）；
+- `PersistenceService` 每轮批量操作通过 `CreateClient()` 创建独立的短生命周期 `SqlSugarClient`（IsAutoCloseConnection），不长期持有连接。
+
+**关系速查表（与代码字段一一对应）：**
+
+| 持有/调用方 | 被持有/被调方 | 关系 | 代码位置 |
+|---|---|---|---|
+| MRedisCacheClient | CacheStore | 组合 1:1 | 私有构造 → `Store` |
+| MRedisCacheClient | RedisSyncService / PersistenceService | 组合 0..1 | `Create` 装配 / `Dispose` 关闭 |
+| MRedisCacheClient | CacheMapRegistry / CacheMap&lt;V&gt; | 组合 | `Maps` / `_mapCache` / `CreateMap` |
+| CacheStore | TableStore | 组合 1:N | `_tables` + `GetTable` |
+| CacheStore | ICacheManager | 聚合 | `_managers` + `RegisterManager` |
+| TableStore | ICacheManager | 聚合 0..1 | `Manager` + `BindManager` 原子守卫 |
+| TableStore | CacheObject | 组合 1:N | `Data` 字典 + 去重脏队列 |
+| CacheObject | CacheStore | 关联 | `Owner`（Attach 时挂接） |
+| CacheManager&lt;T&gt; | MRedisCacheClient / TableStore | 关联 | `_client` / `_table` |
+| CacheManager&lt;T&gt; | RedisSyncService | 依赖 | `EnqueueUpsert / EnqueueDelete` |
+| CacheManager&lt;T&gt; | PersistenceService | 依赖 | `QueryAll / QueryByPrimaryKeys / Execute` |
+| CacheManager&lt;T&gt; | EntityMeta | 依赖 | 静态构造 + 主键索引 / 落库分拣 |
+| CacheMap&lt;V&gt; | RedisSyncService | 依赖 | `EnqueueMapUpsert / EnqueueMapDelete` |
+| CacheMapInfo | CacheMap&lt;V&gt; | 依赖（委托） | `CreateMap` 注册三个回调 |
+| RedisSyncService | CacheStore / CacheMapRegistry / ICacheManager | 依赖 | 应用线程按 Key 路由 |
+| PersistenceService | CacheStore / ICacheManager | 依赖 | 落库线程遍历全部表 |
+| EntityMeta | CacheBehaviorAttribute / CachePrimaryKeyAttribute / SugarColumn | 依赖 | 主键与行为识别 |
+
 ---
 
 ## 2. 旧版问题 → 新版修复对照
