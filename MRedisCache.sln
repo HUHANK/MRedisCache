@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MRedisCache.Core", "MRedisC
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MRedisCache.Demo", "MRedisCache.Demo\MRedisCache.Demo.csproj", "{65370402-820E-4184-979F-BA66E7596402}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MRedisCache.Test", "MRedisCache.Test\MRedisCache.Test.csproj", "{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -41,8 +43,23 @@ Global
 		{65370402-820E-4184-979F-BA66E7596402}.Release|x64.Build.0 = Release|Any CPU
 		{65370402-820E-4184-979F-BA66E7596402}.Release|x86.ActiveCfg = Release|Any CPU
 		{65370402-820E-4184-979F-BA66E7596402}.Release|x86.Build.0 = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|x64.Build.0 = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Debug|x86.Build.0 = Debug|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|x64.ActiveCfg = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|x64.Build.0 = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|x86.ActiveCfg = Release|Any CPU
+		{C367ED43-6FE9-4F7F-9397-97B0E408FEC0}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {E7CA3A76-16E3-40E1-9AB9-C1C053F04D7C}
 	EndGlobalSection
 EndGlobal

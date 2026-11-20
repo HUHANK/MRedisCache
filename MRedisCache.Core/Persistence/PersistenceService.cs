@@ -32,6 +32,23 @@ using SqlSugar;
 namespace MRedisCache
 {
     /// <summary>
+    /// 落库操作类型（ExecuteGroup 单组提交用）。
+    /// Insert / Update / Delete 各自独立提交、独立重试 —— 组间互不影响，
+    /// 避免"部分成功 + 整批重试"造成的重复 INSERT 主键冲突死循环。
+    /// </summary>
+    internal enum FlushAction
+    {
+        /// <summary>批量 INSERT（IsNew 对象）</summary>
+        Insert,
+
+        /// <summary>批量 UPDATE（IsDirty 对象）</summary>
+        Update,
+
+        /// <summary>批量 DELETE（IsDeleted 对象）</summary>
+        Delete
+    }
+
+    /// <summary>
     /// 数据库持久化服务（SqlSugar ORM）：
     ///  1. 落库线程周期性把各表脏队列中的数据按 Insert/Update/Delete 分类批量写入；
     ///  2. 成功后才清除脏标志；失败保留脏标志并重新入队，下个周期重试（修复旧版丢数据问题）；
@@ -174,22 +191,29 @@ namespace MRedisCache
         #endregion
 
         /// <summary>
-        /// 批量执行增删改（CacheManager.FlushUids 调用）：
-        /// 同一轮内按类型分三条批量语句（Insertable / Updateable / Deleteable）。
+        /// 提交单组批量落库（CacheManager.FlushGroup 调用）：
+        /// Insert → Insertable / Update → Updateable / Delete → Deleteable。
         /// Updateable 按主键定位、整行更新（非字段级 —— 见架构文档 6.2 已知限制）。
-        /// 任一语句失败整批抛异常（由 FlushUids 统一走重试路径）。
+        ///
+        /// 关键修复（审查报告 H1）：旧版 Execute 把三组绑在同一次调用里，
+        /// 任一语句失败整批抛异常，调用方整批重试 —— 已成功的 INSERT 会被再次执行，
+        /// 主键冲突 → 落库通道永久重试死循环。单组提交后失败只重试本组，
+        /// 其余组照常落库，组间互不影响。
         /// </summary>
         /// <typeparam name="T">实体类型</typeparam>
-        /// <param name="inserts">新插入对象（IsNew）</param>
-        /// <param name="updates">待更新对象（IsDirty）</param>
-        /// <param name="deletes">待删除对象（IsDeleted）</param>
-        public void Execute<T>(List<T> inserts, List<T> updates, List<T> deletes) where T : class, new()
+        /// <param name="action">本组的操作类型</param>
+        /// <param name="items">本组对象（已按 IsNew / IsDirty / IsDeleted 分拣）</param>
+        public void ExecuteGroup<T>(FlushAction action, List<T> items) where T : class, new()
         {
+            if (items == null || items.Count == 0) return;
             using (SqlSugarClient db = CreateClient())
             {
-                if (inserts.Count > 0) db.Insertable(inserts).ExecuteCommand();
-                if (updates.Count > 0) db.Updateable(updates).ExecuteCommand();
-                if (deletes.Count > 0) db.Deleteable(deletes).ExecuteCommand();
+                switch (action)
+                {
+                    case FlushAction.Insert: db.Insertable(items).ExecuteCommand(); break;
+                    case FlushAction.Update: db.Updateable(items).ExecuteCommand(); break;
+                    case FlushAction.Delete: db.Deleteable(items).ExecuteCommand(); break;
+                }
             }
         }
 

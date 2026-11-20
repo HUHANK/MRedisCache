@@ -205,12 +205,25 @@ namespace MRedisCache
         #region 写入 / 删除
 
         /// <summary>
+        /// 按主键索引取当前注册的对象：索引命中且对象仍在数据字典中才返回 true。
+        /// （主键注册先于 Data 写入的瞬间、或索引指向已移出对象时返回 false，
+        /// 调用方按"无既有对象"处理。）
+        /// </summary>
+        private bool TryGetIndexedObject(string pk, out CacheObject obj)
+        {
+            obj = null;
+            return _primaryKeyIndex.TryGetValue(pk, out long uid)
+                && _table.Data.TryGetValue(uid, out obj);
+        }
+
+        /// <summary>
         /// 新增数据。若主键已存在，则用新值整体覆盖既有对象（等同 Update 语义，
         /// 不做字段级合并 —— 见架构文档 6.2 已知限制）。
         /// 执行顺序：
         ///   1. 计算主键值，无主键拒绝；
-        ///   2. 主键已存在 → ApplyOnto 整体覆盖；
-        ///   3. 否则：分配 UID → 入内存字典 + 主键索引 + 自定义索引
+        ///   2. 主键已存在且对象存活 → ApplyOnto 整体覆盖；
+        ///   3. 否则：分配 UID → 原子注册主键（TryAdd / TryUpdate CAS，并发同主键只有一个赢家）
+        ///      → 入内存字典 + 自定义索引
         ///      →（RedisDatabase 层级）入脏队列 →（非 Local 层级）投递 Redis 异步写。
         /// </summary>
         /// <param name="value">新对象</param>
@@ -226,22 +239,45 @@ namespace MRedisCache
                 return false;
             }
 
-            // 主键已存在：用新值整体覆盖既有对象（等同 Update）
-            if (_primaryKeyIndex.TryGetValue(pk, out long existUid) &&
-                _table.Data.TryGetValue(existUid, out CacheObject existObj) &&
-                !existObj.IsDeleted)
+            // 主键已存在且对象存活：用新值整体覆盖既有对象（等同 Update）
+            if (TryGetIndexedObject(pk, out CacheObject existObj) && !existObj.IsDeleted)
             {
                 ApplyOnto((T)existObj, value);
                 return true;
             }
 
-            // 全新对象：分配 UID → 放入内存与索引 → 进入写通道
+            // 全新对象（或既有对象处于删除隐藏态）：分配 UID → 原子注册主键 → 放入内存与索引。
+            // 关键修复（H2）：旧实现"先 TryGetValue 判断、后写索引"是 check-then-act，
+            // 并发 Add 同主键时两个对象各自分配 UID 双双入缓存 —— 主键索引被后写覆盖、
+            // 先入对象滞留 Data 成为幽灵对象，且两者都 IsNew → 同主键双 INSERT。
+            // 现在用 TryAdd / TryUpdate 原子原语做 CAS 注册：同主键并发 Add 只有一个赢家，
+            // 其余线程重查后转为对赢家对象的覆盖路径，同主键永远只有一个内存对象。
             if (value.CacheObjectUID == 0) value.AssignNewUid();
+            while (true)
+            {
+                if (TryGetIndexedObject(pk, out existObj))
+                {
+                    if (!existObj.IsDeleted)
+                    {
+                        // 注册权被并发线程抢走且其对象存活：转为整体覆盖（等同 Update）
+                        ApplyOnto((T)existObj, value);
+                        return true;
+                    }
+                    // 既有对象处于删除隐藏态（等落库删除）：原子换绑到新对象，
+                    // 旧对象保留在 Data 等落库线程删除
+                    if (_primaryKeyIndex.TryUpdate(pk, value.CacheObjectUID, existObj.CacheObjectUID))
+                        break;
+                    continue;        // 换绑竞争失败：索引被并发改写，重查再试
+                }
+                if (_primaryKeyIndex.TryAdd(pk, value.CacheObjectUID))
+                    break;          // 抢到注册权：本对象成为该主键的唯一内存对象
+                // 注册权被并发线程抢走：重查（下一轮将读到对方对象并走覆盖路径）
+            }
+
             value.Owner = _client.Store;
             value.IsInCache = true;
             value.MarkNew();                       // IsNew=true → 落库时走 INSERT
             _table.Data[value.CacheObjectUID] = value;
-            _primaryKeyIndex[pk] = value.CacheObjectUID;
             AddCustomIndex(value);
 
             if (value.Level == CacheLevel.RedisDatabase)
@@ -477,18 +513,20 @@ namespace MRedisCache
 
         /// <summary>
         /// 把对象放入内存（不触发 Redis / DB 写），供启动加载与读穿透回填使用：
-        /// 分配 UID → 挂 Owner → 入数据字典 + 主键索引 + 自定义索引。
-        /// 主键已存在时跳过（保留内存中更新的数据）。
+        /// 分配 UID → 原子注册主键 → 挂 Owner → 入数据字典 + 自定义索引。
+        /// 主键已注册时直接放弃（保留内存中已有的对象）。
+        /// 关键修复（H2）：旧实现 ContainsKey 判断 + 事后写索引是 check-then-act，
+        /// 并发加载 / 回源 / 远端合并同主键时会放入两个实例（幽灵对象）；
+        /// TryAdd 原子注册后竞争失败方直接放弃，同主键永远只有一个内存对象。
         /// </summary>
         private void Attach(T obj)
         {
             string pk = EntityMeta.GetPrimaryKeyValue(obj);
-            if (_primaryKeyIndex.ContainsKey(pk)) return;
             if (obj.CacheObjectUID == 0) obj.AssignNewUid();
+            if (!_primaryKeyIndex.TryAdd(pk, obj.CacheObjectUID)) return;
             obj.Owner = _client.Store;
             obj.IsInCache = true;
             _table.Data[obj.CacheObjectUID] = obj;
-            _primaryKeyIndex[pk] = obj.CacheObjectUID;
             AddCustomIndex(obj);
         }
 
@@ -556,11 +594,13 @@ namespace MRedisCache
         /// <summary>
         /// 落库单批执行（对应架构文档 3.3 节第 7 步）：
         ///   1. 从内存字典捞出对象，按 IsNew / IsDirty / IsDeleted 分成三组；
-        ///   2. SqlSugar 批量执行（同批三条 SQL：Insertable / Updateable / Deleteable）；
+        ///   2. 三组各自独立提交（顺序：删除 → 插入 → 更新，组间互不影响）；
         ///   3. 成功后才 MarkSaved 清脏标志 / 移出已删除对象
         ///      （关键修复：旧版先清后写，失败即丢数据）；
-        ///   4. 失败：记日志 + 整批 UID 重新入脏队列，下个周期重试
-        ///      （IsDeleted 对象保持隐藏态持续重试，直到 DB 删除成功）。
+        ///   4. 失败：仅本组对象重新入脏队列，下个周期重试
+        ///      （关键修复 H1：旧版"任一组失败整批重试"，insert 成功而 update 失败时，
+        ///        已插入的行会再次 INSERT → 主键冲突 → 落库通道永久死循环；
+        ///        单组重试 + 先删后插后，同主键"删除未落库时重新 Add"也能在同一轮收敛）。
         /// </summary>
         private void FlushUids(List<long> uids)
         {
@@ -581,28 +621,47 @@ namespace MRedisCache
                 else if (obj.IsDirty) updates.Add((T)obj);
             }
 
-            if (inserts.Count == 0 && updates.Count == 0 && deletes.Count == 0) return;
+            // 三组独立提交（先删后插）：单组失败只重试本组，不影响其他组
+            FlushGroup(FlushAction.Delete, deletes);
+            FlushGroup(FlushAction.Insert, inserts);
+            FlushGroup(FlushAction.Update, updates);
+        }
 
+        /// <summary>
+        /// 提交一组落库操作并处理结果：
+        ///   成功 → MarkSaved 清脏标志（Delete 组移出内存，对象完成使命）；
+        ///   失败 → 仅本组对象重新入脏队列，下个周期重试（不丢数据、不拖累其他组）。
+        /// </summary>
+        /// <param name="action">操作类型</param>
+        /// <param name="items">本组对象</param>
+        private void FlushGroup(FlushAction action, List<T> items)
+        {
+            if (items.Count == 0) return;
             try
             {
-                _client.Persistence.Execute(inserts, updates, deletes);
+                _client.Persistence.ExecuteGroup(action, items);
 
                 // 关键修复：成功之后才清脏标志（旧版先清后写，失败即丢数据）
-                foreach (T item in inserts) item.MarkSaved();
-                foreach (T item in updates) item.MarkSaved();
-                foreach (CacheObject deleted in deletes)
+                if (action == FlushAction.Delete)
                 {
-                    // DB 删除成功，对象完成使命，真正移出内存
-                    deleted.IsInCache = false;
-                    _table.Data.TryRemove(deleted.CacheObjectUID, out _);
+                    foreach (CacheObject deleted in items)
+                    {
+                        // DB 删除成功，对象完成使命，真正移出内存
+                        deleted.IsInCache = false;
+                        _table.Data.TryRemove(deleted.CacheObjectUID, out _);
+                    }
                 }
-                Log.Debug($"Manager<{TableName}> 落库成功：insert {inserts.Count} / update {updates.Count} / delete {deletes.Count}。");
+                else
+                {
+                    foreach (T item in items) item.MarkSaved();
+                }
+                Log.Debug($"Manager<{TableName}> 落库成功：{action} {items.Count} 条。");
             }
             catch (Exception ex)
             {
-                // 失败：脏标志未清（Add/字段变更路径本来就标记着），把本轮 UID 重新入队，下个周期重试
-                Log.Error($"Manager<{TableName}> 落库失败，将在下个周期重试（insert {inserts.Count} / update {updates.Count} / delete {deletes.Count}）", ex);
-                foreach (long uid in uids) _table.MarkDirty(uid);
+                // 失败：脏标志未清（Add/字段变更路径本来就标记着），仅本组重新入队，下个周期重试
+                Log.Error($"Manager<{TableName}> 落库失败，将在下个周期重试（{action} {items.Count} 条）", ex);
+                foreach (T item in items) _table.MarkDirty(item.CacheObjectUID);
             }
         }
 

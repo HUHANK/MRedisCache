@@ -271,7 +271,7 @@ classDiagram
     CacheManager~T~ --> MRedisCacheClient : _client
     CacheManager~T~ --> TableStore : _table
     CacheManager~T~ ..> RedisSyncService : EnqueueUpsert / EnqueueDelete
-    CacheManager~T~ ..> PersistenceService : QueryAll / QueryByPrimaryKeys / Execute
+    CacheManager~T~ ..> PersistenceService : QueryAll / QueryByPrimaryKeys / ExecuteGroup
     CacheManager~T~ ..> EntityMeta : 主键与行为元数据
     EntityMeta ..> CacheBehaviorAttribute : GetBehavior
     EntityMeta ..> CachePrimaryKeyAttribute : 主键识别（优先级 2）
@@ -335,7 +335,7 @@ classDiagram
         +CreateClient() SqlSugarClient
         +QueryAll() List
         +QueryByPrimaryKeys(probe, primaryKeys) T
-        +Execute(inserts, updates, deletes)
+        +ExecuteGroup(action, items)
     }
 
     RedisWrite --> RedisOp : Op
@@ -371,7 +371,7 @@ classDiagram
 | CacheObject | CacheStore | 关联 | `Owner`（Attach 时挂接） |
 | CacheManager&lt;T&gt; | MRedisCacheClient / TableStore | 关联 | `_client` / `_table` |
 | CacheManager&lt;T&gt; | RedisSyncService | 依赖 | `EnqueueUpsert / EnqueueDelete` |
-| CacheManager&lt;T&gt; | PersistenceService | 依赖 | `QueryAll / QueryByPrimaryKeys / Execute` |
+| CacheManager&lt;T&gt; | PersistenceService | 依赖 | `QueryAll / QueryByPrimaryKeys / ExecuteGroup` |
 | CacheManager&lt;T&gt; | EntityMeta | 依赖 | 静态构造 + 主键索引 / 落库分拣 |
 | CacheMap&lt;V&gt; | RedisSyncService | 依赖 | `EnqueueMapUpsert / EnqueueMapDelete` |
 | CacheMapInfo | CacheMap&lt;V&gt; | 依赖（委托） | `CreateMap` 注册三个回调 |
@@ -548,10 +548,10 @@ flowchart TD
 
     subgraph FWT["落库线程（PersistenceService，周期 FlushIntervalMs）"]
         F1["FlushOnce：遍历全部表"] --> F2["TakeDirty(FlushBatchSize)<br/>按 IsNew/IsDirty/IsDeleted 分拣"]
-        F2 --> F3["SqlSugar 批量执行<br/>Insertable / Updateable / Deleteable"]
+        F2 --> F3["三组独立提交（先删后插）<br/>Insertable / Updateable / Deleteable"]
         F3 --> F4{"成功?"}
         F4 -->|"是"| F5["MarkSaved 清脏标志<br/>删除成功 → 移出内存"]
-        F4 -->|"否"| F6["记日志 + 重新入脏队列<br/>下周期重试（不丢数据）"]
+        F4 -->|"否"| F6["记日志 + 本组重新入脏队列<br/>下周期重试（不拖累其他组）"]
         F1 --> F7["EvictOnce 过期淘汰（限流 EvictBatchLimit，低优先级）"]
     end
 
@@ -586,9 +586,12 @@ Redis 写线程（独立后台任务）:
   7. 遍历全部 TableStore → Manager.FlushDirty()
      7.1 table.TakeDirty(FlushBatchSize) 取一批脏 UID
      7.2 按 IsNew / IsDirty / IsDeleted 分成 insert / update / delete 三组
-     7.3 SqlSugar 批量执行：Insertable / Updateable / Deleteable
-     7.4 成功 → MarkSaved() 清脏标志；删除成功 → 移出 Data
-     7.5 失败 → 记日志 + 全部 UID 重新 MarkDirty 入队，下周期重试
+     7.3 三组各自独立提交（顺序：删除 → 插入 → 更新）：Insertable / Updateable / Deleteable
+         —— 单组失败不影响其他组，杜绝"insert 已成功、update 失败后整批重试
+            → 重复 INSERT 撞主键"的永久死循环；先删后插让"删除未落库时
+            同主键重新 Add"在同一轮内即可收敛
+     7.4 单组成功 → MarkSaved() 清脏标志；删除成功 → 移出 Data
+     7.5 单组失败 → 记日志 + 仅本组 UID 重新 MarkDirty 入队，下个周期重试
   8. 同周期顺带 ProcessExpired（限流 EvictBatchLimit，低优先级）
 ```
 
