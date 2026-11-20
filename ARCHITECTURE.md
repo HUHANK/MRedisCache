@@ -112,6 +112,7 @@ classDiagram
         +string ConnectionString
         +List~string~ RedisEndpoints
         +int RedisBatchSize
+        +int RedisDefaultDb
         +int FlushIntervalMs
         +int FlushBatchSize
         +int ReconcileIntervalSeconds
@@ -799,6 +800,7 @@ var options = new MRedisCacheOptions
     DbType = DbType.Oracle,                          // SqlServer / MySql / PostgreSQL ...
     ConnectionString = "...",
     RedisEndpoints = new List<string> { "10.10.10.252:6379" },
+    RedisDefaultDb = 0,                                // 可选：默认 DB（-1 = 服务器默认）
     FlushIntervalMs = 1000,
     ReconcileIntervalSeconds = 300
 };

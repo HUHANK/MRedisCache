@@ -54,6 +54,15 @@ namespace MRedisCache
         /// </summary>
         public int RedisBatchSize { get; set; } = 300;
 
+        /// <summary>
+        /// Redis 默认 DB 编号（默认 0；可用范围取决于服务器的 databases 配置，通常 0-15）。
+        /// 全部 Hash 读写（HSET / HGET / HGET_ALL / HMGET）、Lua 执行与频道订阅
+        /// 都在该 DB 上进行；-1 = 不指定，沿用服务器默认（通常 db0）。
+        /// 同一套缓存的多实例靠 CacheName 隔离即可；需要与存量数据共用同一 Redis
+        /// 实例时，可用本参数切到独立 DB 做物理隔离。
+        /// </summary>
+        public int RedisDefaultDb { get; set; } = 9;
+
         // ---------------- 落库 ----------------
 
         /// <summary>

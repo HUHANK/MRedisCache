@@ -171,6 +171,11 @@ redis.call('PUBLISH', ARGV[2], cjson.encode({ Sender = ARGV[3], Option = 'D', Ke
                 AbortOnConnectFail = false,
                 ReconnectRetryPolicy = new ExponentialRetry(5000)
             };
+            // 默认 DB（RedisDefaultDb）：本实例的 Hash 读写、Lua 执行与订阅
+            // 全部经由 GetDatabase() 返回的同一个 IDatabase，因此只需在连接配置上
+            // 指定 DefaultDatabase 即可全局生效；-1 = 不指定，沿用服务器默认（通常 db0）。
+            if (options.RedisDefaultDb >= 0)
+                config.DefaultDatabase = options.RedisDefaultDb;
             foreach (string endpoint in options.RedisEndpoints)
                 config.EndPoints.Add(endpoint);
 
@@ -202,7 +207,7 @@ redis.call('PUBLISH', ARGV[2], cjson.encode({ Sender = ARGV[3], Option = 'D', Ke
             // 连接恢复 → 对账（弥补断线期间丢失的发布消息）
             _mux.ConnectionRestored += OnConnectionRestored;
 
-            Log.Info($"Redis 已连接（{string.Join(",", options.RedisEndpoints)}），订阅频道 {_channelName}。");
+            Log.Info($"Redis 已连接（{string.Join(",", options.RedisEndpoints)}），默认 DB = {config.DefaultDatabase?.ToString() ?? "服务器默认"}，订阅频道 {_channelName}。");
         }
 
         #region 写入入口（业务线程调用，全部非阻塞）
